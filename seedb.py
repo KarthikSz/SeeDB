@@ -87,7 +87,7 @@ class SeeDB:
         q = np.array( q )
         return( [ r , q  ] )
 
-    def recommend_views( self , user_dataset_condition , reference_dataset_condition , n_phases = 10 ):
+    def recommend_views( self , user_dataset_condition , reference_dataset_condition , num_phases = 10 ):
         '''
         Inputs:
         user_dataset_condition     : what goes in the WHERE sql clause
@@ -99,7 +99,7 @@ class SeeDB:
         potential_views = self.populate_potential_view_params()
 
         itr_phase = 0
-        for start, end in self.phase_idx_generator( n_phases ):
+        for start, end in self.generate_indices_phase( num_phases ):
             itr_phase += 1
             itr_view = -1
             view_distances = []
@@ -215,16 +215,16 @@ class SeeDB:
             self.generate_plot( table_query , val_query , val_reference ,  labels , dimension_attribute , aggregate_fn , measure_attribute ,
             label_query , folder_path )
 
-    def phase_idx_generator(self, n_phases=10):
+    def generate_indices_phase( self , num_phases = 10 ):
         '''
         Divides the data into mini-batches (indexes ??)
         and returns the mini-batches (indexes ??) for query.
         With feauture-first grouping ???
         '''
-        batch_size = np.floor(self.num_rows/n_phases).astype(int)
-        return [ ( batch_size*i , batch_size*(i+1) ) for i in range( n_phases ) ]
+        batch_size = self.num_rows // num_phases  # Using integer division directly
+        return [ ( batch_size * i, batch_size * ( i + 1 ) ) for i in range( num_phases ) ]
 
-    def calc_conf_interval( self , iter_phase, N_phase = 10 ):
+    def calc_conf_error( self , iter_phase, N_phase = 10 ):
         '''
         Divides the data into mini-batches (indexes ??)
         and returns the mini-batches (indexes ??) for query.
@@ -238,30 +238,30 @@ class SeeDB:
         conf_error = np.sqrt(a*(b+c)*d)
         return conf_error
 
-    def prune( self, kl_divg, iter_phase, N_phase = 10, delta = 0.05, k = 5 ):
-        '''
-        input: a list of KL divergences of the potential views, batch number
-        output: a list of indices of the views that should be discarded
-        '''
-        kl_divg = np.array( kl_divg )
-        if iter_phase == 1:
+    def prune(self, kl_divergences, current_phase, total_phases=10, delta=0.05, top_k=5):
+        if current_phase == 1:
+            # No pruning in the first phase
             return []
-        N = len( kl_divg )
 
-        # sort the kl divergences
-        kl_sorted = np.sort( kl_divg )[ : : -1 ]
-        index = np.argsort(kl_divg)[ : : -1 ]
-        if iter_phase == N_phase:
-            return index[ k : ]
+        # Convert KL divergences to a numpy array for efficient operations
+        kl_divergences = np.array(kl_divergences)
+        sorted_indices = np.argsort(kl_divergences)[::-1]
+        sorted_kl_divergences = kl_divergences[sorted_indices]
 
-        # Calculate the confidence interval
-        conf_error = self.calc_conf_interval( iter_phase, N_phase )
+        # If in the last phase, return indices of all but the top_k views
+        if current_phase == total_phases:
+            return sorted_indices[top_k:]
 
-        min_kl_divg = kl_sorted[ k - 1 ] - conf_error
-        for i in range( k , N ):
-            if kl_sorted[ i ] + conf_error < min_kl_divg:
-                return index[ i : ]
-        return []
+        # Calculate the confidence interval error
+        conf_error = self.calc_conf_error(current_phase, total_phases)
+
+        # Find the threshold KL divergence below which views are pruned
+        threshold_kl = sorted_kl_divergences[top_k - 1] - conf_error
+
+        # Identify indices of divergences falling below the threshold, considering the confidence error
+        prune_start_index = np.argmax(sorted_kl_divergences[top_k:] + conf_error < threshold_kl) + top_k
+        return sorted_indices[prune_start_index:] if prune_start_index < len(sorted_kl_divergences) else []
+
 
 if __name__ == '__main__':
     seedb = SeeDB( 'mini_project' , 'postgres' , [ 'fnlwgt' , 'age' , 'capital_gain' , 'capital_loss' , 'hours_per_week' ] ,
