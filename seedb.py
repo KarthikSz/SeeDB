@@ -240,35 +240,32 @@ class SeeDB:
 
     def prune(self, kl_divergences, current_phase, total_phases=10, delta=0.05, top_k=5):
         if current_phase == 1:
-            # No pruning in the first phase
             return []
 
-        # Convert KL divergences to a numpy array for efficient operations
         kl_divergences = np.array(kl_divergences)
+        if len(kl_divergences) <= top_k:
+            return []  # Return empty or handle differently if there are not enough divergences
+
         sorted_indices = np.argsort(kl_divergences)[::-1]
         sorted_kl_divergences = kl_divergences[sorted_indices]
 
-        # If in the last phase, return indices of all but the top_k views
         if current_phase == total_phases:
             return sorted_indices[top_k:]
 
-        # Calculate the confidence interval error
         conf_error = self.calc_conf_error(current_phase, total_phases)
-
-        # Find the threshold KL divergence below which views are pruned
         threshold_kl = sorted_kl_divergences[top_k - 1] - conf_error
+        if len(sorted_kl_divergences) > top_k:
+            prune_start_index = np.argmax(sorted_kl_divergences[top_k:] + conf_error < threshold_kl) + top_k
+            return sorted_indices[prune_start_index:] if prune_start_index < len(sorted_kl_divergences) else []
 
-        # Identify indices of divergences falling below the threshold, considering the confidence error
-        prune_start_index = np.argmax(sorted_kl_divergences[top_k:] + conf_error < threshold_kl) + top_k
-        return sorted_indices[prune_start_index:] if prune_start_index < len(sorted_kl_divergences) else []
-
+        return []
 
 if __name__ == '__main__':
     seedb = SeeDB( 'mini_project' , 'postgres' , [ 'fnlwgt' , 'age' , 'capital_gain' , 'capital_loss' , 'hours_per_week' ] ,
     [ 'workclass' , 'education' , 'occupation' , 'relationship' , 'race' , 'native_country' , 'salary' ] , 'census' )
     # recommend_views test
-    reference_dataset = "marital_status in (' Married-civ-spouse', ' Married-spouse-absent', ' Married-AF-spouse')"
-    user_dataset = "marital_status in (' Divorced', ' Never-married', ' Separated', ' Widowed')"
+    reference_dataset = "marital_status in (' Divorced', ' Never-married', ' Separated', ' Widowed')"
+    user_dataset = "marital_status in (' Married-civ-spouse', ' Married-spouse-absent', ' Married-AF-spouse')"
     views = seedb.recommend_views( user_dataset , reference_dataset , 5 )
     labels = [ 'Married' , 'Unmarried' ]
     seedb.visualize( views , user_dataset , reference_dataset ,  [ 'Married' , 'Unmarried' ] ,
