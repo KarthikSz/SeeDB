@@ -16,12 +16,11 @@ class DB_Functions:
         host = "localhost" ,  port = "5432" )
         return( conn )
 
-    def select_query( self , conn , query ):
+    def ffetch_data( self , conn , query , return_df = False ):
+        if return_df == True:
+            return pd.read_sql_query( query , conn , params = None )
         cur = conn.cursor()
         cur.execute( query )
         rows = cur.fetchall()
         return rows
-
-    def fetch_data( self , conn , query , query_params = None ):
-        return pd.read_sql_query( query , conn , params = query_params )
 
