@@ -1,228 +1,218 @@
-from typing import List
 from DB_Functions import DB_Functions
 import matplotlib.pyplot as plt
-from sqlalchemy import create_engine
-import pandas as pd
 import numpy as np
 from scipy.stats import entropy
 import CTE_fstrings
+from scipy.special import kl_div
+import os
 
 class SeeDB:
-    def __init__( self , db_name , user , measure_attributes , dimension_attributes , table_name ):
+    def __init__( self , db_name , user , measure_attributes , dimension_attributes , table ):
         self.db_handler = DB_Functions()
-        self.db = self.db_handler.connect_database( db_name , user )
-        self.num_rows = self.db_handler.select_query( self.db , ( 'select count(*) from ' + table_name ))[ 0 ][ 0 ]
+        self.database_connection = self.db_handler.connect_database( db_name , user )
+        self.num_rows = self.db_handler.ffetch_data( self.database_connection ,
+        ( 'select count(*) from ' + table ))[ 0 ][ 0 ]
         self.measure_attributes = measure_attributes
         self.dimension_attributes = dimension_attributes
-        self.table_name = table_name
-        self.functions = [ 'avg' , 'min' , 'max' , 'sum' , 'count' ]
+        self.table = table
+        self.aggregate_fns = [ 'max' , 'sum' , 'count' ,  'avg' , 'min' ]
 
-    def kl_divergence( self , p1 , p2 ):
-        eps = 1e-5
-        p1 = p1/( np.sum( p1 ) + eps )
-        p2 = p2/( np.sum( p2 ) + eps )
-        p1[ np.where( p1 < eps ) ] = eps
-        p2[ np.where( p2 < eps )] = eps
-        kl_divg = entropy( p1 , p2 )
+    def compute_kl_div( self , prob_dist_1 , prob_dist_2 ):
+        epsilon = 1e-5
+        prob_dist_1 = prob_dist_1/( np.sum( prob_dist_1 ) + epsilon )
+        prob_dist_2 = prob_dist_2/( np.sum( prob_dist_2 ) + epsilon )
+        prob_dist_1 = np.clip( prob_dist_1 , epsilon , None )
+        prob_dist_2 = np.clip( prob_dist_2 , epsilon , None )
+        kl_divg = np.sum( kl_div( prob_dist_1 , prob_dist_2 ) )
         return kl_divg
 
-    def populate_candidate_params( self ):
-        candidate_views = dict()
+    def populate_potential_view_params( self ):
+        potential_views = dict()
         for dimension_attribute in self.dimension_attributes:
-            for measure in self.measure_attributes:
-                for func in self.functions:
-                    if dimension_attribute not in candidate_views:
-                        candidate_views[ dimension_attribute ] = dict()
-                    if measure not in candidate_views[ dimension_attribute ]:
-                        candidate_views[ dimension_attribute ][ measure ] = set()
-                    candidate_views[ dimension_attribute ][ measure ].add( func )
-        return candidate_views
+            for measure_attribute in self.measure_attributes:
+                for aggregate_fn in self.aggregate_fns:
+                    if dimension_attribute not in potential_views:
+                        potential_views[ dimension_attribute ] = dict()
+                    if measure_attribute not in potential_views[ dimension_attribute ]:
+                        potential_views[ dimension_attribute ][ measure_attribute ] = set()
+                    potential_views[ dimension_attribute ][ measure_attribute ].add( aggregate_fn )
+        return potential_views
 
-    def get_recommended_views( self , candidate_views ):
-        recommended_views = []
-        for dimension_attribute in candidate_views:
-            for measure in candidate_views[ dimension_attribute ]:
-                for func in candidate_views[ dimension_attribute ][ measure ]:
-                    recommended_views.append( ( dimension_attribute , measure , func ) )
-        return recommended_views
+    def get_suggested_views( self , potential_views ):
+        suggested_views = []
+        for dimension_attribute in potential_views:
+            for measure_attribute in potential_views[ dimension_attribute ]:
+                for aggregate_fn in potential_views[ dimension_attribute ][ measure_attribute ]:
+                    suggested_views.append( ( dimension_attribute , measure_attribute , aggregate_fn ) )
+        return suggested_views
 
-    def get_selections( self , candidate_views , dimension_attribute , query_dataset_cond , reference_dataset_cond ):
-        query_selections = ''
-        ref_selections = ''
-        for measure in candidate_views[ dimension_attribute ]:
-            for func in candidate_views[ dimension_attribute ][ measure ]:
-                # Create selections for query and reference dataset with unique labels
-                query_func = CTE_fstrings.query_func_cte_fstring.format( func = func, 
-                    cond = query_dataset_cond , 
-                    measure = measure
+    def get_combined_selection_query( self , potential_views , dimension_attribute , user_dataset_condition , reference_dataset_condition ):
+        user_selection = ''
+        reference_selection = ''
+        for measure_attribute in potential_views[ dimension_attribute ]:
+            for aggregate_fn in potential_views[ dimension_attribute ][ measure_attribute ]:
+                user_fn = CTE_fstrings.user_fn_cte_fstring.format( fn = aggregate_fn , 
+                    condition = user_dataset_condition , 
+                    measure_attribute = measure_attribute
                 )
 
-                ref_func = CTE_fstrings.ref_func_cte_fstring.format(
-                    func = func ,
-                    cond = reference_dataset_cond ,
-                    measure = measure
+                reference_fn = CTE_fstrings.reference_fn_cte_fstring.format(
+                    fn = aggregate_fn ,
+                    condition = reference_dataset_condition ,
+                    measure_attribute = measure_attribute
                 )
 
-                query_selections += '{}, '.format( query_func )
-                ref_selections += '{}, '.format( ref_func )
+                user_selection += '{}, '.format( user_fn )
+                reference_selection += '{}, '.format( reference_fn )
 
                 # Remove the trailing comma and space
-        all_selections = query_selections + ref_selections[ : -2 ]
-        return all_selections
+        combined_selection = user_selection + reference_selection[ : -2 ]
+        return combined_selection
 
-    def delete_pruned_views( self , candidate_views , mappings_distidx_view , pruned_view_indexes , dist_views  ):
-        pruned_views = [ mappings_distidx_view[ idx ] for idx in pruned_view_indexes ]
-        print( len( dist_views ) , len( pruned_view_indexes ) )
-        for dimension_attribute, measure, func in pruned_views:
-            candidate_views[ dimension_attribute ][ measure ].remove( func )
-            if len( candidate_views[ dimension_attribute ][ measure ] ) == 0:
-                del candidate_views[ dimension_attribute ][ measure ]
-                if len( candidate_views[ dimension_attribute ] ) == 0:
-                    del candidate_views[ dimension_attribute ]
-        return( candidate_views )
+    def delete_pruned_views( self , potential_views , distance_index_mappings_view , pruned_view_indexes , view_distances  ):
+        pruned_views = [ distance_index_mappings_view[ id ] for id in pruned_view_indexes ]
+        print( len( view_distances ) , len( pruned_view_indexes ) )
+        for dimension_attribute, measure_attribute, aggregate_fn in pruned_views:
+            potential_views[ dimension_attribute ][ measure_attribute ].remove( aggregate_fn )
+            if len( potential_views[ dimension_attribute ][ measure_attribute ] ) == 0:
+                del potential_views[ dimension_attribute ][ measure_attribute ]
+                if len( potential_views[ dimension_attribute ] ) == 0:
+                    del potential_views[ dimension_attribute ]
+        return( potential_views )
 
     def split_combined_df( self , combine_df ):
-        r = self.split_dataframe_by_keyword( combine_df , 'ref' )
+        r = self.filter_df_keyword( combine_df , 'reference' )
         r = np.array( r ) 
-        q = self.split_dataframe_by_keyword( combine_df , 'query' )
+        q = self.filter_df_keyword( combine_df , 'user' )
         q = np.array( q )
         return( [ r , q  ] )
 
-    def recommend_views( self , query_dataset_cond , reference_dataset_cond , n_phases = 10 ):
+    def recommend_views( self , user_dataset_condition , reference_dataset_condition , n_phases = 10 ):
         '''
         Inputs:
-        query_dataset_cond     : what goes in the WHERE sql clause
-                                 to get query dataset
-        reference_dataset_cond : what goes in the WHERE sql clause
+        user_dataset_condition     : what goes in the WHERE sql clause
+                                 to get user dataset
+        reference_dataset_condition : what goes in the WHERE sql clause
                                  to get reference dataset
         '''
-        dist_fn_pruning = self.kl_divergence   # distance function for pruning
-        candidate_views = self.populate_candidate_params()
+        dist_fn_pruning = self.compute_kl_div   # distance function for pruning
+        potential_views = self.populate_potential_view_params()
 
         itr_phase = 0
         for start, end in self.phase_idx_generator( n_phases ):
             itr_phase += 1
             itr_view = -1
-            dist_views = []
-            mappings_distidx_view = dict()
+            view_distances = []
+            distance_index_mappings_view = dict()
 
             # Initialize a CTE to ensure all attributes are represented in the output
-            for dimension_attribute in candidate_views:
+            for dimension_attribute in potential_views:
                 attributes_cte = CTE_fstrings.attributes_cte_fstring.format( attribute = dimension_attribute ,
-                table_name = self.table_name )
-                all_selections = self.get_selections( candidate_views , dimension_attribute , query_dataset_cond , reference_dataset_cond )
+                table = self.table )
+                all_selections = self.get_combined_selection_query( potential_views , dimension_attribute , user_dataset_condition , reference_dataset_condition )
 
                 # Generate the combined SQL query for the current attribute using the attributes CTE
                 combined_query = CTE_fstrings.combined_query_cte_fstring.format(
                     attributes_cte = attributes_cte ,
                     all_selections = all_selections ,
-                    table_name = self.table_name ,
+                    table = self.table ,
                     attribute = dimension_attribute ,
                     start = start ,
                     end = end
                 )
 
                 print( "Combined Query:" , combined_query )
-                combine_df = self.db_handler.fetch_data( self.db , combined_query , query_params = None )
+                combine_df = self.db_handler.ffetch_data( self.database_connection , combined_query , return_df = True )
                 [ r , q ] = self.split_combined_df( combine_df )
                 ## for pruning
                 itr_col = -1
-                for measure in candidate_views[ dimension_attribute ]:
-                    for func in candidate_views[ dimension_attribute ][ measure ]:
+                for measure_attribute in potential_views[ dimension_attribute ]:
+                    for aggregate_fn in potential_views[ dimension_attribute ][ measure_attribute ]:
                         itr_view += 1
                         itr_col += 1
                         d = dist_fn_pruning( q[ : , itr_col ] , r[ : , itr_col ] )
-                        dist_views.append( d )
-                        mappings_distidx_view[ itr_view ] = ( dimension_attribute , measure , func )
+                        view_distances.append( d )
+                        distance_index_mappings_view[ itr_view ] = ( dimension_attribute , measure_attribute , aggregate_fn )
 
             ## prune
-            pruned_view_indexes = self.prune( dist_views , itr_phase )
+            pruned_view_indexes = self.prune( view_distances , itr_phase )
 
-            candidate_views = self.delete_pruned_views( candidate_views , mappings_distidx_view , pruned_view_indexes ,
-            dist_views  )
+            potential_views = self.delete_pruned_views( potential_views , distance_index_mappings_view , pruned_view_indexes ,
+            view_distances  )
 
-        recommended_views = self.get_recommended_views( candidate_views )
-        return recommended_views
+        suggested_views = self.get_suggested_views( potential_views )
+        return suggested_views
     
-    def _make_combined_view_query( self , selections , table_name , dimension_attribute , start , end ):
-        return CTE_fstrings.make_combined_view_query_fstring.format(
+    def construct_combined_view_query( self , selections , table , dimension_attribute , start , end ):
+        return CTE_fstrings.construct_combined_view_query_fstring.format(
             attribute = dimension_attribute ,
             selections = selections ,
-            table_name = table_name ,
+            table = table ,
             start = start ,
             end = end
         )
 
-    def split_dataframe_by_keyword( self , df , keyword ):
+    def filter_df_keyword( self , df , keyword ):
         # Filter columns that contain the keyword and always include the first column (assuming it's the key attribute here)
         filtered_columns =  [ col for col in df.columns if keyword in col ] 
         # Drop duplicates to ensure the first column is not repeated if it contains the keyword
         filtered_columns = list( dict.fromkeys( filtered_columns ) )
         return df[ filtered_columns ]
 
-    def _make_view_query( self , selections , table_name , cond , dimension_attribute , start , end ):
-        return ' '.join(['with attrs as (select distinct('
-                            + dimension_attribute + ') as __atr__',
-                            'from', table_name , ')',
-                        'select', selections ,
-                        'from', 'attrs left outer join', table_name ,
-                            'on', '__atr__ =', dimension_attribute ,
-                            'and', cond ,
-                            'and id>=' + str( start ) , 'and' , 'id<' + str( end ) ,
-                        'group by __atr__' ,
-                        'order by __atr__' ] )
+    def construct_view_query( self , selections , table , condition , dimension_attribute , start , end ):
+        view_query = CTE_fstrings.construct_view_query_fstring.format(dimension_attribute, table, selections, condition, start, end)
+        return view_query.strip()
 
-
-    def generate_plot( self , table_query , val_query , val_reference ,  labels , dimension_attribute , function , measure , label_query , folder_path ):
+    def generate_plot(self, table_query, val_query, val_reference, labels,
+    dimension_attribute, aggregate_fn, measure_attribute, label_query, folder_path):
         plt.figure()
-        n_groups = table_query.shape[ 0 ]
-        index = np.arange( n_groups )
+        n_groups = table_query.shape[0]
+        index = np.arange(n_groups)
         bar_width = 0.35
         opacity = 0.8
 
-        rects1 = plt.bar( index , val_query , bar_width ,
-                            alpha = opacity ,
-                            color = 'b',
-                            label = labels[ 0 ] )
+        # Create bars for the main and reference values
+        plt.bar(index, val_query, bar_width,
+                alpha=opacity, color='b', label=labels[0])
+        plt.bar(index + bar_width, val_reference, bar_width,
+                alpha=opacity, color='g', label=labels[1])
 
-        rects2 = plt.bar( index + bar_width , val_reference , bar_width ,
-                            alpha = opacity ,
-                            color = 'g' ,
-                            label = labels[ 1 ] )
-
-        plt.xlabel( dimension_attribute )
-        print( function + '(' + measure + ')' )
-        plt.ylabel( function + '(' + measure + ')' ) 
-        plt.xticks( index + bar_width , tuple( label_query ) , rotation = 90 )
+        # Set labels, legend, and save the plot
+        plt.xlabel(dimension_attribute)
+        plt.ylabel('{0}({1})'.format(aggregate_fn, measure_attribute))
+        plt.xticks(index + bar_width / 2, label_query, rotation=90)
         plt.legend()
         plt.tight_layout()
-        plt.savefig( folder_path + dimension_attribute + '_' + measure + '_' + function + '.png', dpi = 300 )
+
+        plot_filename = '{0}_{1}_{2}.png'.format(dimension_attribute, measure_attribute, aggregate_fn)
+        plt.savefig(os.path.join(folder_path, plot_filename), dpi=300)
         plt.close()
 
-    def visualize( self , views , query_dataset_cond , reference_dataset_cond ,
+
+    def visualize( self , views , user_dataset_condition , reference_dataset_condition ,
             labels = None , folder_path = 'visualizations/' ):
         '''
 
         '''
         if labels == None:
-            labels = ['Query','Reference']
+            labels = ['user','Reference']
         for view in views:
             print(view)
-            dimension_attribute, measure, function = view
+            dimension_attribute, measure_attribute, aggregate_fn = view
             # get the query table result
-            selection = '__atr__'+' , coalesce('+function + '(' + measure + '), 0) '
-            query_dataset_query = self._make_view_query(selection,
-                    self.table_name, query_dataset_cond, dimension_attribute, 0, self.num_rows)
-            reference_dataset_query = self._make_view_query(selection,
-                    self.table_name, reference_dataset_cond, dimension_attribute, 0, self.num_rows)
-            table_query = np.array( self.db_handler.select_query(self.db, query_dataset_query))
-            table_reference = np.array( self.db_handler.select_query(self.db, reference_dataset_query))
+            selection = '__atr__'+' , coalesce('+aggregate_fn + '(' + measure_attribute + '), 0) '
+            user_dataset_query = self.construct_view_query(selection,
+                    self.table, user_dataset_condition, dimension_attribute, 0, self.num_rows)
+            reference_dataset_query = self.construct_view_query(selection,
+                    self.table, reference_dataset_condition, dimension_attribute, 0, self.num_rows)
+            table_query = np.array( self.db_handler.ffetch_data(self.database_connection, user_dataset_query))
+            table_reference = np.array( self.db_handler.ffetch_data(self.database_connection, reference_dataset_query))
             val_query = table_query[ : , 1 ].astype( float )
             label_query = table_query[ : , 0 ]
             val_reference = table_reference[:,1].astype(float)
             a = val_query
             b = val_reference
-            self.generate_plot( table_query , val_query , val_reference ,  labels , dimension_attribute , function , measure ,
+            self.generate_plot( table_query , val_query , val_reference ,  labels , dimension_attribute , aggregate_fn , measure_attribute ,
             label_query , folder_path )
 
     def phase_idx_generator(self, n_phases=10):
@@ -250,7 +240,7 @@ class SeeDB:
 
     def prune( self, kl_divg, iter_phase, N_phase = 10, delta = 0.05, k = 5 ):
         '''
-        input: a list of KL divergences of the candidate views, batch number
+        input: a list of KL divergences of the potential views, batch number
         output: a list of indices of the views that should be discarded
         '''
         kl_divg = np.array( kl_divg )
@@ -274,13 +264,13 @@ class SeeDB:
         return []
 
 if __name__ == '__main__':
-    seedb = SeeDB( 'mini_project' , 'postgres' , [ 'fnlwgt' , 'age' , 'capital_gain' , 'capital_loss' , 'hours_per_week' ] , [ 'workclass' , 'education' , 'occupation' , 
-    'relationship' , 'race' , 'native_country' , 'salary' ] , 'census' )
+    seedb = SeeDB( 'mini_project' , 'postgres' , [ 'fnlwgt' , 'age' , 'capital_gain' , 'capital_loss' , 'hours_per_week' ] ,
+    [ 'workclass' , 'education' , 'occupation' , 'relationship' , 'race' , 'native_country' , 'salary' ] , 'census' )
     # recommend_views test
-    ref_dataset = "marital_status in (' Married-civ-spouse', ' Married-spouse-absent', ' Married-AF-spouse')"
-    query_dataset = "marital_status in (' Divorced', ' Never-married', ' Separated', ' Widowed')"
-    views = seedb.recommend_views( query_dataset , ref_dataset , 5 )
+    reference_dataset = "marital_status in (' Married-civ-spouse', ' Married-spouse-absent', ' Married-AF-spouse')"
+    user_dataset = "marital_status in (' Divorced', ' Never-married', ' Separated', ' Widowed')"
+    views = seedb.recommend_views( user_dataset , reference_dataset , 5 )
     labels = [ 'Married' , 'Unmarried' ]
-    seedb.visualize( views , query_dataset , ref_dataset ,  [ 'Married' , 'Unmarried' ] ,
+    seedb.visualize( views , user_dataset , reference_dataset ,  [ 'Married' , 'Unmarried' ] ,
     folder_path = 'visualizations/sex/' )
 
